@@ -44,6 +44,18 @@
 # COMMAND ----------
 
 # TODO: Create streaming table definition
+from pyspark import pipelines as dp
+from pyspark.sql.types import ArrayType, StringType
+from pyspark.sql import functions as F
+import re
+
+# Fix for Twitter date format parsing
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+
+dp.create_streaming_table(
+    name="tweets_silver",
+    comment="Cleaned tweet text with extracted @mentions. One row per mention per tweet. Tweets without mentions preserved with mention=NULL."
+)
 
 
 # COMMAND ----------
@@ -63,6 +75,12 @@
 
 # TODO: Define find_mentions function and create UDF
 
+def find_mentions(text):
+    if text is None:
+        return []
+    return re.findall(r"@[\w]+", text)
+
+find_mentions_udf = F.udf(find_mentions, ArrayType(StringType()))
 
 # COMMAND ----------
 
@@ -83,6 +101,24 @@
 # COMMAND ----------
 
 # TODO: Define append_flow function for silver transformation
+@dp.append_flow(target="tweets_silver")
+def transform_tweets():
+    return (
+        spark.readStream
+            .table("tweets_bronze")
+            .withColumn("cleaned_text", F.regexp_replace(F.col("text"), r"@\S+", ""))
+            .withColumn("mentions", find_mentions_udf(F.col("text")))
+            .withColumn("mention", F.explode_outer(F.col("mentions")))
+            .withColumn("mention", F.lower(F.col("mention")))
+            .withColumn("timestamp", F.to_timestamp(F.col("date"), "EEE MMM dd HH:mm:ss zzz yyyy"))
+            .select(
+                F.col("timestamp"),
+                F.col("mention"),
+                F.col("cleaned_text"),
+                F.col("text"),
+                F.col("sentiment")
+            )
+    )
 
 
 # COMMAND ----------

@@ -47,7 +47,15 @@
 # COMMAND ----------
 
 # TODO: Create streaming table definition
+from pyspark import pipelines as dp
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from pyspark.sql import functions as F
+import mlflow
 
+dp.create_streaming_table(
+    name="tweets_gold",
+    comment="Tweet data enriched with ML sentiment predictions. Includes predicted sentiment, confidence scores, and binary indicators for classification metrics."
+)
 
 # COMMAND ----------
 
@@ -60,7 +68,7 @@
 # COMMAND ----------
 
 # TODO: Configure MLflow registry
-
+mlflow.set_registry_uri("databricks-uc")
 
 # COMMAND ----------
 
@@ -74,6 +82,10 @@
 # COMMAND ----------
 
 # TODO: Define model output schema
+MODEL_OUTPUT_SCHEMA = StructType([
+    StructField("label", StringType(), True),   # "POSITIVE" or "NEGATIVE"
+    StructField("score", DoubleType(), True),    # confidence 0.0-1.0
+])
 
 
 # COMMAND ----------
@@ -91,6 +103,26 @@
 
 # TODO: Load model and create Spark UDF
 
+from pyspark.sql.functions import pandas_udf
+import pandas as pd
+
+MODEL_OUTPUT_SCHEMA = "struct<label:string, score:double>"
+
+@pandas_udf(MODEL_OUTPUT_SCHEMA)
+def sentiment_udf(texts: pd.Series) -> pd.DataFrame:
+    import mlflow
+    import os
+    os.environ["MLFLOW_TRACKING_URI"] = "databricks"
+    mlflow.set_tracking_uri("databricks")
+    model = mlflow.pyfunc.load_model(
+        "/Volumes/workspace/default/checkpoints/model_cache/"
+    )
+    texts_list = texts.fillna("neutral tweet").tolist()
+    results = model.predict(texts_list)
+    return pd.DataFrame({
+        "label": results["label"],
+        "score": results["score"]
+    })
 
 # COMMAND ----------
 
@@ -115,7 +147,34 @@
 # COMMAND ----------
 
 # TODO: Define append_flow function for gold transformation
-
+@dp.append_flow(target="tweets_gold")
+def predict_sentiment():
+    return (
+        spark.readStream
+            .table("tweets_silver")
+            .withColumn("prediction", sentiment_udf(F.col("cleaned_text")))
+            .withColumn("predicted_label", F.col("prediction.label"))
+            .withColumn("predicted_score", F.col("prediction.score") * 100)
+            .withColumn("predicted_sentiment",
+                F.when(F.col("predicted_label") == "LABEL_0", "negative")
+                 .when(F.col("predicted_label") == "LABEL_1", "neutral")
+                 .when(F.col("predicted_label") == "LABEL_2", "positive")
+                 .when(F.col("predicted_label") == "NEGATIVE", "negative")
+                 .otherwise("positive")
+            )
+            .withColumn("sentiment_id",
+                F.when(F.col("sentiment") == "0", 0).otherwise(1)
+            )
+            .withColumn("predicted_sentiment_id",
+                F.when(F.col("predicted_sentiment") == "negative", 0)
+                 .otherwise(1)
+            )
+            .select(
+                "timestamp", "mention", "cleaned_text", "text", "sentiment",
+                "predicted_score", "predicted_sentiment",
+                "sentiment_id", "predicted_sentiment_id"
+            )
+    )
 
 # COMMAND ----------
 
